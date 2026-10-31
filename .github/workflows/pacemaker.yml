@@ -1,0 +1,74 @@
+name: instabox-pacemaker
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pacemaker
+  cancel-in-progress: false
+
+jobs:
+  poke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Renew activity lease
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          MACHINE_ID: ${{ secrets.INSTABOX_MACHINE_ID }}
+        run: |
+          set -u
+          API="https://api.instabox.sh"
+          LEASE="keepalive"
+          TTL=600
+          renew() {
+            curl -sS -m 30 -X PUT "$API/v1/machines/$MACHINE_ID/activity-leases/$LEASE" \
+              -H "X-API-Key: $INSTABOX_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"ttlSeconds\":$TTL}" \
+              -w "\n%{http_code}"
+          }
+          resp="$(renew)" || { echo "lease request failed to send"; exit 1; }
+          code="$(printf '%s' "$resp" | tail -n 1)"
+          body="$(printf '%s' "$resp" | sed '$d')"
+          echo "lease HTTP $code"
+          echo "$body"
+          if [ "$code" = "409" ]; then
+            echo "machine not running; waking"
+            wcode="$(curl -sS -m 30 -X POST "$API/v1/machines/$MACHINE_ID/resume" -H "X-API-Key: $INSTABOX_API_KEY" -H "Idempotency-Key: pacemaker-resume-$(date +%s)" -o /dev/null -w "%{http_code}")" || wcode=0
+            echo "resume HTTP $wcode"
+            if [ "$wcode" != "200" ] && [ "$wcode" != "202" ]; then
+              scode="$(curl -sS -m 30 -X POST "$API/v1/machines/$MACHINE_ID/start" -H "X-API-Key: $INSTABOX_API_KEY" -H "Idempotency-Key: pacemaker-start-$(date +%s)" -o /dev/null -w "%{http_code}")" || scode=0
+              echo "start HTTP $scode"
+            fi
+            ok=""
+            for i in 1 2 3 4 5 6; do
+              sleep 5
+              resp="$(renew)" || continue
+              code="$(printf '%s' "$resp" | tail -n 1)"
+              body="$(printf '%s' "$resp" | sed '$d')"
+              echo "retry lease HTTP $code"
+              echo "$body"
+              if [ "$code" = "200" ] || [ "$code" = "204" ]; then ok=1; break; fi
+            done
+            if [ -z "$ok" ]; then echo "lease still failing after wake"; exit 1; fi
+          fi
+          if [ "$code" != "200" ] && [ "$code" != "204" ]; then
+            echo "lease failed with HTTP $code"
+            exit 1
+          fi
+          echo "keepalive ok"
+      - name: Record poke
+        run: |
+          git clone --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo
+          cd repo
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > last-poke.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-poke.txt
+          git commit -m "poke" || exit 0
+          git push
